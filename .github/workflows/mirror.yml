@@ -16,6 +16,7 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
+    timeout-minutes: 90      # 整個 job 的硬性上限,超過就自動結束,絕不會卡住不放
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -25,21 +26,63 @@ jobs:
 
       - name: Mirror the whole site with wget
         run: |
+          set +e   # 自己控制重試,不要一失敗就中斷整個步驟
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-          wget \
-            --mirror \
-            --page-requisites \
-            --convert-links \
-            --adjust-extension \
-            --span-hosts \
-            --domains=zhuyuxiao.weebly.com,cdn1.editmysite.com,cdn2.editmysite.com,cdn3.editmysite.com,fonts.googleapis.com,fonts.gstatic.com \
-            -e robots=off \
-            --restrict-file-names=windows \
-            --tries=3 --wait=0.3 --random-wait \
-            --user-agent="$UA" \
-            --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
-            --header="Accept-Language: zh-TW,zh;q=0.9,en;q=0.8" \
-            https://zhuyuxiao.weebly.com/ || true
+
+          do_mirror() {
+            # wget --mirror 具有時間戳記機制:重跑會自動略過已下載的檔案,
+            # 只補抓上次因 429 漏掉的部分,所以可以安全地反覆執行來「填坑」。
+            wget \
+              --mirror --page-requisites --convert-links --adjust-extension --span-hosts \
+              --domains=zhuyuxiao.weebly.com,cdn1.editmysite.com,cdn2.editmysite.com,cdn3.editmysite.com,fonts.googleapis.com,fonts.gstatic.com \
+              -e robots=off --restrict-file-names=windows \
+              --tries=8 --retry-on-http-error=429,500,502,503,522,524 \
+              --waitretry=60 --wait=2 --random-wait \
+              --user-agent="$UA" \
+              --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+              --header="Accept-Language: zh-TW,zh;q=0.9,en;q=0.8" \
+              --header="Upgrade-Insecure-Requests: 1" \
+              --header="Sec-Fetch-Dest: document" \
+              --header="Sec-Fetch-Mode: navigate" \
+              --header="Sec-Fetch-Site: none" \
+              --header="Referer: https://zhuyuxiao.weebly.com/" \
+              https://zhuyuxiao.weebly.com/
+          }
+
+          # 最多 8 輪。每輪之間等待時間越來越長(2、4、6…分鐘),
+          # 讓 Weebly 對這台 IP 的限流有時間解除。整體最多等約半小時以上。
+          THRESHOLD=25   # 抓到的頁面/檔案數達標就收工(全站約 35 頁 + 數百張圖)
+          for round in $(seq 1 8); do
+            echo "===================== 第 $round 輪 ====================="
+
+            # 暖身:先探首頁,回 200 才值得跑 wget;還在 429 就直接等下一輪
+            code=$(curl -s -o /dev/null -w "%{http_code}" -A "$UA" https://zhuyuxiao.weebly.com/)
+            echo "首頁探測:HTTP ${code:-000}"
+
+            if [ "$code" = "200" ]; then
+              do_mirror
+            else
+              echo "首頁仍被限流(HTTP ${code:-000}),本輪先不抓。"
+            fi
+
+            n=$(find zhuyuxiao.weebly.com -type f 2>/dev/null | wc -l)
+            n=${n:-0}
+            echo "目前累積檔案數(zhuyuxiao 網域):$n"
+
+            if [ -f "zhuyuxiao.weebly.com/index.html" ] && [ "$n" -ge "$THRESHOLD" ]; then
+              echo "已達標,結束重試。"
+              break
+            fi
+
+            if [ "$round" -lt 8 ]; then
+              wait_sec=$(( round * 120 ))
+              echo "尚未完成,等待 ${wait_sec} 秒後再試下一輪…(慢慢來)"
+              sleep "$wait_sec"
+            fi
+          done
+
+          echo "===================== 重試結束 ====================="
+          echo "最終累積檔案數:$(find zhuyuxiao.weebly.com -type f 2>/dev/null | wc -l)"
 
           # 把鏡像下來的各網域資料夾集中到 site/
           rm -rf site && mkdir -p site
