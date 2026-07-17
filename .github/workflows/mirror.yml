@@ -1,0 +1,87 @@
+name: Mirror & Deploy Weebly
+
+# 手動觸發:到 repo 的 Actions 分頁,選這個 workflow,按 Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write      # 把鏡像檔 commit 回 repo(永久保存)
+  pages: write         # 發佈 GitHub Pages
+  id-token: write      # Pages 部署需要
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Mirror the whole site with wget
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          wget \
+            --mirror \
+            --page-requisites \
+            --convert-links \
+            --adjust-extension \
+            --span-hosts \
+            --domains=zhuyuxiao.weebly.com,cdn1.editmysite.com,cdn2.editmysite.com,cdn3.editmysite.com,fonts.googleapis.com,fonts.gstatic.com \
+            -e robots=off \
+            --restrict-file-names=windows \
+            --tries=3 --wait=0.3 --random-wait \
+            --user-agent="$UA" \
+            --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+            --header="Accept-Language: zh-TW,zh;q=0.9,en;q=0.8" \
+            https://zhuyuxiao.weebly.com/ || true
+
+          # 把鏡像下來的各網域資料夾集中到 site/
+          rm -rf site && mkdir -p site
+          for d in zhuyuxiao.weebly.com cdn1.editmysite.com cdn2.editmysite.com cdn3.editmysite.com fonts.googleapis.com fonts.gstatic.com; do
+            if [ -d "$d" ]; then mv "$d" site/; fi
+          done
+
+          # 根目錄放一個自動跳轉到首頁的 index.html
+          printf '%s\n' '<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=./zhuyuxiao.weebly.com/index.html"><title>HO`ME</title><a href="./zhuyuxiao.weebly.com/index.html">進入網站 / Enter site</a></html>' > site/index.html
+
+          echo "抓到的檔案總數:"
+          find site -type f | wc -l
+          echo "其中圖片數:"
+          find site -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \) | wc -l
+
+      - name: Commit mirror back to repo (永久保存)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add site
+          git commit -m "Update Weebly mirror" || echo "沒有變更,略過 commit"
+          git push || echo "略過 push"
+
+      - name: Zip the backup
+        run: |
+          cd site && zip -r ../weebly-backup.zip . >/dev/null && cd ..
+          ls -la weebly-backup.zip
+
+      - name: Upload zip as downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weebly-backup-zip
+          path: weebly-backup.zip
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
