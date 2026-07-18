@@ -29,12 +29,54 @@ jobs:
           set +e   # 自己控制重試,不要一失敗就中斷整個步驟
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
+          # 完整的 35 頁清單(取自 sitemap)。當「種子」餵給 wget,
+          # 這樣連導覽列已經不再連過去的「孤兒頁面」(例如舊版 uiiii 那批遊記)也會被強制抓下來。
+          cat > urls.txt <<'URLS'
+          https://zhuyuxiao.weebly.com/index.html
+          https://zhuyuxiao.weebly.com/all.html
+          https://zhuyuxiao.weebly.com/performance.html
+          https://zhuyuxiao.weebly.com/21507.html
+          https://zhuyuxiao.weebly.com/uiiii.html
+          https://zhuyuxiao.weebly.com/36208.html
+          https://zhuyuxiao.weebly.com/38587353282925535486.html
+          https://zhuyuxiao.weebly.com/20231-20232.html
+          https://zhuyuxiao.weebly.com/about.html
+          https://zhuyuxiao.weebly.com/uiiii/july-13th-2022
+          https://zhuyuxiao.weebly.com/uiiii/7677377
+          https://zhuyuxiao.weebly.com/uiiii/8079883
+          https://zhuyuxiao.weebly.com/uiiii/1374669
+          https://zhuyuxiao.weebly.com/uiiii/xpark
+          https://zhuyuxiao.weebly.com/uiiii/morning
+          https://zhuyuxiao.weebly.com/uiiii/2009829
+          https://zhuyuxiao.weebly.com/36208/1619621
+          https://zhuyuxiao.weebly.com/36208/2913109
+          https://zhuyuxiao.weebly.com/36208/7735419
+          https://zhuyuxiao.weebly.com/36208/7693571
+          https://zhuyuxiao.weebly.com/36208/august-02nd-2023
+          https://zhuyuxiao.weebly.com/36208/9172644
+          https://zhuyuxiao.weebly.com/21507/719
+          https://zhuyuxiao.weebly.com/21507/9511365
+          https://zhuyuxiao.weebly.com/performance/3924022
+          https://zhuyuxiao.weebly.com/38587353282925535486/day1-in
+          https://zhuyuxiao.weebly.com/38587353282925535486/august-16th-2022
+          https://zhuyuxiao.weebly.com/38587353282925535486/w1
+          https://zhuyuxiao.weebly.com/38587353282925535486/6839475
+          https://zhuyuxiao.weebly.com/38587353282925535486/6777668
+          https://zhuyuxiao.weebly.com/38587353282925535486/3432582
+          https://zhuyuxiao.weebly.com/38587353282925535486/3259418
+          https://zhuyuxiao.weebly.com/20231-20232/february-11th-2023
+          https://zhuyuxiao.weebly.com/20231-20232/125
+          https://zhuyuxiao.weebly.com/20231-20232/211
+          URLS
+          # heredoc 前面的縮排會被一起寫進去,去掉每行開頭空白
+          sed -i 's/^[[:space:]]*//' urls.txt
+
           do_mirror() {
             # wget --mirror 具有時間戳記機制:重跑會自動略過已下載的檔案,
             # 只補抓上次因 429 漏掉的部分,所以可以安全地反覆執行來「填坑」。
             wget \
               --mirror --page-requisites --convert-links --adjust-extension --span-hosts \
-              --domains=zhuyuxiao.weebly.com,cdn1.editmysite.com,cdn2.editmysite.com,cdn3.editmysite.com,fonts.googleapis.com,fonts.gstatic.com \
+              --domains=zhuyuxiao.weebly.com,editmysite.com,fonts.googleapis.com,fonts.gstatic.com \
               -e robots=off --restrict-file-names=windows \
               --tries=8 --retry-on-http-error=429,500,502,503,522,524 \
               --waitretry=60 --wait=2 --random-wait \
@@ -46,6 +88,7 @@ jobs:
               --header="Sec-Fetch-Mode: navigate" \
               --header="Sec-Fetch-Site: none" \
               --header="Referer: https://zhuyuxiao.weebly.com/" \
+              --input-file=urls.txt \
               https://zhuyuxiao.weebly.com/
           }
 
@@ -85,9 +128,16 @@ jobs:
           echo "最終累積檔案數:$(find zhuyuxiao.weebly.com -type f 2>/dev/null | wc -l)"
 
           # 把鏡像下來的各網域資料夾集中到 site/
+          # 用萬用比對:凡是 wget 建出來的「主機名資料夾」(zhuyuxiao.weebly.com、
+          # 任何 *.editmysite.com、fonts.* 等)全部收進 site/,不再寫死名字,
+          # 這樣新出現的 CDN 子網域(cdn.editmysite.com、st1.editmysite.com…)也不會漏。
+          # .github 是隱藏資料夾,不會被 */ 比對到;site 自己排除。
           rm -rf site && mkdir -p site
-          for d in zhuyuxiao.weebly.com cdn1.editmysite.com cdn2.editmysite.com cdn3.editmysite.com fonts.googleapis.com fonts.gstatic.com; do
-            if [ -d "$d" ]; then mv "$d" site/; fi
+          shopt -s nullglob
+          for d in */; do
+            name="${d%/}"
+            [ "$name" = "site" ] && continue
+            mv "$d" site/
           done
 
           # 根目錄放一個自動跳轉到首頁的 index.html
@@ -97,6 +147,134 @@ jobs:
           find site -type f | wc -l
           echo "其中圖片數:"
           find site -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \) | wc -l
+
+      - name: Localize links — 把已下載資源的連結改成指向本地
+        run: |
+          python3 - <<'PY'
+          import os, re
+          ROOT = "site"
+          # 找出 site/ 底下所有「主機名資料夾」(zhuyuxiao.weebly.com、*.editmysite.com、fonts.*)
+          hosts = [d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d)) and "." in d]
+          host_re = "|".join(re.escape(h) for h in hosts)
+          # 比對 http(s):// 或 // 開頭、指向這些本機主機的絕對網址
+          pat = re.compile(r'(?:https?:)?//(' + host_re + r')/([^\s"\'<>()]*)')
+
+          def local_exists(host, path):
+              p = path.split('?', 1)[0].split('#', 1)[0]
+              if p == '' or p.endswith('/'):
+                  p = p + 'index.html'
+              cand = os.path.join(ROOT, host, p)
+              return os.path.isfile(cand), p
+
+          changed_files = 0
+          rewrites = 0
+          for dirpath, _, files in os.walk(ROOT):
+              for fn in files:
+                  if not fn.lower().endswith(('.html', '.htm', '.css', '.js')):
+                      continue
+                  fp = os.path.join(dirpath, fn)
+                  rel = os.path.relpath(dirpath, ROOT)
+                  depth = 0 if rel == '.' else rel.count(os.sep) + 1
+                  prefix = '../' * depth
+                  try:
+                      with open(fp, 'r', encoding='utf-8', errors='surrogateescape') as f:
+                          txt = f.read()
+                  except Exception:
+                      continue
+
+                  def repl(m):
+                      nonlocal_host, path = m.group(1), m.group(2)
+                      exists, cleanpath = local_exists(nonlocal_host, path)
+                      if exists:
+                          return prefix + nonlocal_host + '/' + cleanpath
+                      return m.group(0)   # 本地沒有這個檔就保留原網址(關站前仍可顯示)
+
+                  new, n = pat.subn(repl, txt)
+                  if n and new != txt:
+                      with open(fp, 'w', encoding='utf-8', errors='surrogateescape') as f:
+                          f.write(new)
+                      changed_files += 1
+                      rewrites += n
+          print(f"在地化完成:改寫 {rewrites} 處連結,涉及 {changed_files} 個檔案。")
+
+          # 統計還有多少「指向 weebly.com 但本地沒有」的殘留(代表還沒抓到的資源)
+          leftover = 0
+          for dirpath, _, files in os.walk(ROOT):
+              for fn in files:
+                  if fn.lower().endswith(('.html', '.htm', '.css')):
+                      try:
+                          t = open(os.path.join(dirpath, fn), encoding='utf-8', errors='surrogateescape').read()
+                      except Exception:
+                          continue
+                      leftover += len(re.findall(r'//zhuyuxiao\.weebly\.com/', t))
+          print(f"仍指向 zhuyuxiao.weebly.com 的殘留連結數:{leftover}(理想為 0;>0 代表還有資源沒抓到,再跑一次可補齊)")
+          PY
+
+      - name: Verify — 檢查 35 個該有的頁面與資源
+        run: |
+          set +e
+          BASE="site/zhuyuxiao.weebly.com"
+          echo "================ 頁面完整度檢查 ================"
+          PAGES="
+          index.html
+          all.html
+          performance.html
+          21507.html
+          uiiii.html
+          36208.html
+          38587353282925535486.html
+          20231-20232.html
+          about.html
+          uiiii/july-13th-2022.html
+          uiiii/7677377.html
+          uiiii/8079883.html
+          uiiii/1374669.html
+          uiiii/xpark.html
+          uiiii/morning.html
+          uiiii/2009829.html
+          36208/1619621.html
+          36208/2913109.html
+          36208/7735419.html
+          36208/7693571.html
+          36208/august-02nd-2023.html
+          36208/9172644.html
+          21507/719.html
+          21507/9511365.html
+          performance/3924022.html
+          38587353282925535486/day1-in.html
+          38587353282925535486/august-16th-2022.html
+          38587353282925535486/w1.html
+          38587353282925535486/6839475.html
+          38587353282925535486/6777668.html
+          38587353282925535486/3432582.html
+          38587353282925535486/3259418.html
+          20231-20232/february-11th-2023.html
+          20231-20232/125.html
+          20231-20232/211.html
+          "
+          ok=0; miss=0; missing_list=""
+          for p in $PAGES; do
+            [ -z "$p" ] && continue
+            if [ -f "$BASE/$p" ]; then
+              ok=$((ok+1))
+            else
+              miss=$((miss+1)); missing_list="$missing_list $p"
+            fi
+          done
+          echo "頁面 OK:$ok / 35"
+          if [ "$miss" -gt 0 ]; then
+            echo "★ 尚缺頁面($miss 個):$missing_list"
+            echo "  → 這些才是真正要在意的;重跑一次 workflow 通常就會把它們補齊。"
+          else
+            echo "✓ 35 個頁面全部到齊。"
+          fi
+          echo "------------------------------------------------"
+          echo "JS 檔數 :$(find site -type f -iname '*.js'  | wc -l)"
+          echo "CSS 檔數:$(find site -type f -iname '*.css' | wc -l)"
+          echo "圖片數  :$(find site -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.webp' \) | wc -l)"
+          echo "================================================"
+          echo "註:Action log 裡零星的 404(favicon、預留圖、圖片尺寸變體等)屬正常,"
+          echo "    只要上面 35 個頁面到齊、CSS/JS/圖片數量合理,備份就是完整的。"
 
       - name: Commit mirror back to repo (永久保存)
         run: |
